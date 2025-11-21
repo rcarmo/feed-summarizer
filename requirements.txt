@@ -1,0 +1,26 @@
+jinja2
+schedule
+aiohttp
+feedparser
+beautifulsoup4
+asyncio
+pytest-asyncio
+pyyaml
+#readability-python
+readability-lxml
+python-dotenv
+markdownify
+Markdown
+feedgen
+pypdf>=4.2.0
+pytest
+openai>=1.48.0
+
+# Telemetry (OpenTelemetry + Azure Monitor exporter)
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-instrumentation
+opentelemetry-instrumentation-aiohttp-client
+opentelemetry-instrumentation-logging
+opentelemetry-instrumentation-sqlite3
+azure-monitor-opentelemetry-exporter

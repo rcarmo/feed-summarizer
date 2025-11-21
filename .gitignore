@@ -1,0 +1,63 @@
+# 1. Environment / secrets
+.env
+secrets.yaml
+secrets.yaml.gpg
+*.gpg
+*.pem
+*.key
+
+# 2. Python bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 3. Virtual environments / tooling
+.venv/
+venv/
+env/
+.DS_Store
+
+# 4. Databases & journals
+feeds.db*
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# 5. Build / distribution artifacts (if packaging later)
+build/
+dist/
+*.egg-info/
+
+# 6. Generated site artifacts (currently treating all of public/ as generated)
+# If you decide to version template shells (e.g. index.html), remove or narrow this.
+public/
+
+# 7. Local config variants
+*.local.yaml
+*.override.yaml
+secrets.yaml
+
+# 8. Logs & scratch
+*.log
+tmp/
+scratch/
+
+# 9. OS / editor
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# 10. Misc
+*.bak
+*.swp
+*.orig
+*.gpg
+
+# End of file

@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title_text or summary_group.title() }} News Summary</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            line-height: 1.6;
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f8f9fa;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 40px;
+            padding: 30px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-radius: 15px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+        }
+        .header h1 {
+            margin: 0;
+            font-size: 2.5em;
+            font-weight: 300;
+        }
+        .introduction {
+            background: white;
+            padding: 25px;
+            margin-bottom: 30px;
+            border-radius: 10px;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.05);
+            border-left: 4px solid #667eea;
+        }
+        .topic-section {
+            background: white;
+            margin-bottom: 25px;
+            border-radius: 10px;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.05);
+            overflow: hidden;
+        }
+        .topic-header {
+            background: #f8f9fa;
+            padding: 20px 25px;
+            border-bottom: 1px solid #e9ecef;
+        }
+        .topic-header h2 {
+            margin: 0;
+            color: #2c3e50;
+            font-size: 1.4em;
+            font-weight: 600;
+        }
+        .summary-item {
+            padding: 20px 25px;
+            border-bottom: 1px solid #f1f3f4;
+        }
+        .summary-item:last-child {
+            border-bottom: none;
+        }
+        .summary-text {
+            font-size: 1.05em;
+            line-height: 1.6;
+            margin-bottom: 10px;
+        }
+        .summary-meta {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+            font-size: 0.9em;
+            color: #666;
+        }
+        .summary-link {
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 500;
+        }
+        .summary-link:hover {
+            text-decoration: underline;
+        }
+        .footer {
+            text-align: center;
+            margin-top: 40px;
+            padding: 20px;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>{{ title_text or summary_group.title() }}</h1>
+        <p>Generated on {{ current_time.strftime('%B %d, %Y at %H:%M UTC') }}</p>
+    </div>
+
+    {% if introduction %}
+    <div class="introduction">
+        <h2>📝 Overview</h2>
+        <p>{{ introduction }}</p>
+    </div>
+    {% endif %}
+
+    {% for topic, topic_summaries in sorted_topics|groupby('topic') %}
+    <div class="topic-section">
+        <div class="topic-header">
+            <h2>{{ topic }}</h2>
+        </div>
+        {% for summary in topic_summaries %}
+        <div class="summary-item">
+            <div class="summary-text">{{ summary.summary_text }}</div>
+            <div class="summary-meta">
+                {% if summary.item_url %}
+                <a href="{{ summary.item_url }}" class="summary-link" target="_blank">{{ summary.item_title or 'Read more' }}</a>
+                {% endif %}
+                <span class="summary-date">
+                    {% if summary.feed_slug %}Source: {{ summary.feed_slug }}{% endif %}
+                    {% if summary.item_date %} • Published: {{ summary.item_date.strftime('%B %d, %Y') }}{% endif %}
+                </span>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    {% endfor %}
+
+    <div class="footer">
+        <p>
+            🤖 This bulletin contains AI-generated summaries of news articles from various sources.<br>
+            Summaries are grouped by topic and sorted by publication date.
+        </p>
+        <p>
+            <strong>Total summaries:</strong> {{ summaries|length }} • 
+            <strong>Topics covered:</strong> {{ topic_count }} • 
+            <strong>Last updated:</strong> {{ current_time.strftime('%B %d, %Y at %H:%M UTC') }}
+        </p>
+    </div>
+</body>
+</html>

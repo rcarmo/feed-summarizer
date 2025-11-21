@@ -1,0 +1,42 @@
+---
+services:
+  worker:
+    command: python3 -u main.py scheduled
+    runtime: python
+    environment:
+      APPLICATIONINSIGHTS_CONNECTION_STRING: "InstrumentationKey=786dce2e-f997-41f2-a308-e67a236b80ce;IngestionEndpoint=https://eastus2-3.in.applicationinsights.azure.com/;LiveEndpoint=https://eastus2.livediagnostics.monitor.azure.com/;ApplicationId=355339eb-ab1c-4d6f-8787-304251db5694"
+      PYTHONIOENCODING: "UTF_8:replace"
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: "/app"
+      SECRETS_FILE: "/run/secrets/feed_summarizer"
+      DATA_PATH: "/data"
+      DATABASE_PATH: "/data/feeds.db"
+      SCHEDULER_RUN_IMMEDIATELY: "true"
+      DEBUG: "false"
+      LANG: "en_US.UTF-8"
+      LC_ALL: "en_US.UTF-8"
+      TZ: "Europe/Lisbon"
+    secrets:
+      - feed_summarizer
+    depends_on:
+      - tor
+    deploy:
+      replicas: 1
+      update_config:
+        order: stop-first
+        parallelism: 1
+        delay: 10s
+        failure_action: rollback
+
+  tor:
+    build:
+      context: ./tor
+      dockerfile: Dockerfile
+    image: kata-tor:latest
+    environment:
+      TOR_INSTANCES: "2"
+      TOR_REBUILD_INTERVAL: "1800"
+ 
+secrets:
+  feed_summarizer:
+    external: true

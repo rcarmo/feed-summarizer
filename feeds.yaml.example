@@ -1,0 +1,68 @@
+---
+# feeds.yaml.example
+#
+# Minimal, sanitized configuration example for the feed summarizer.
+# Copy to feeds.yaml and customize. Comments explain each section.
+# Lines starting with '##' highlight important guidance.
+
+feeds:
+  # Basic RSS/Atom feed (key = slug used internally)
+  planet-python:
+    url: https://planetpython.org/rss20.xml
+    # interval_minutes: 30        # optional per-feed refresh interval (fallback: global env FETCH_INTERVAL_MINUTES)
+
+  # Example: enable reader mode (fetch full article content / readability extraction)
+  techdirt:
+    url: https://www.techdirt.com/feed/
+    reader_mode: true             # optional; only set when needed (adds latency and bandwidth)
+
+  # Example Mastodon list timeline (requires an API token in env or secrets)
+  # Uncomment to use:
+  # mastodon-news:
+  #   type: mastodon
+  #   url: https://mastodon.social/api/v1/timelines/list/12345
+  #   title: News List
+  #   token_env: MASTODON_APP_TOKEN   # set in .env or secrets.yaml (preferred)
+  #   summarize: false                # set true if you want it in AI summaries
+  #   limit: 40                       # optional (default 40)
+
+summaries:
+  # Group feeds into bulletin / topic summaries. Comma-separated list of feed slugs.
+  # Optional: intro: true -> generate an AI intro paragraph for the group.
+  devnews:
+    feeds: planet-python, techdirt
+    intro: true
+  # Additional examples:
+  # ai:
+  #   feeds: mastodon-news
+  #   intro: false
+
+# Optional: generate raw passthrough RSS feeds for selected inputs (no summarization)
+# Either a simple list of feed slugs or objects with more options.
+# passthrough:
+#   - planet-python
+#   - mastodon-news
+
+thresholds:
+  time_window_hours: 48    # fetcher ignores older entries unless initial bootstrap kicks in
+  retention_days: 7        # number of days bulletins/raw feeds stay published
+  initial_fetch_items: 10  # for brand new feeds, allow up to N most recent entries regardless of age
+
+# Schedule for generating bulletins (local times in provided timezone)
+# Times are 24h strings. You can list several, they will be triggered daily.
+schedule:
+  timezone: UTC
+  times:
+    - "06:00"
+    - "12:00"
+    - "18:00"
+
+## Additional Notes
+# - If you add a feed with reader_mode: true, ensure the content source allows fetching.
+# - To exclude a feed from summaries, simply omit it from all groups in 'summaries'.
+# - Hidden feeds (hidden: true) can be processed but not published individually (feature optional).
+# - To integrate Mastodon, set MASTODON_APP_TOKEN in environment or secrets.yaml.
+# - Adjust schedule times to your audience timezone; keep them sparse to respect rate limits.
+# - Use summarize: false per feed (if supported) to explicitly skip AI summarization for certain sources.
+# - If you need per-feed refresh intervals, set interval_minutes or refresh_interval_minutes under that feed.
+
