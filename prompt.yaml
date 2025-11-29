@@ -36,6 +36,28 @@ summaries: |
   EXAMPLE (schema only):
   [{"summary": "One or two sentence summary for Item 1.", "id": 123, "topic": "Technology"}]
 
+similar_merge: |
+  ROLE: You are a news editor at The Economist.
+
+  INPUT: A list of summaries (plain text) each with an ID.
+
+  TASK:
+  - Identify summaries that are very similar or overlapping in content.
+  - Merge similar summaries into a single, concise summary that captures the shared content.
+  - For merged summaries, combine their IDs into a list.
+  
+  OUTPUT FORMAT (must be exact):
+  - A RAW JSON array (no preamble, no postscript, no code fences, no Markdown).
+  - Each element: {"summary": string, "ids": [list of IDs]}
+  - Preserve each ID EXACTLY as provided (same value/type if possible). Do NOT invent or guess IDs.
+  - Valid JSON only: proper quoting, no trailing commas.
+  
+  QUALITY BAR:
+  - Merged summaries should be clear, concise, and avoid repetition.
+
+  EXAMPLE (schema only):
+  [{"summary": "Merged summary for similar items.", "ids": [123, 456]}]
+
 intro: |
   ROLE: You are a daily news editor at The Economist.
 
