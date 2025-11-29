@@ -203,6 +203,20 @@ class Config:
         self.MAX_ITEMS_PER_FEED = self._validate_positive_int("MAX_ITEMS_PER_FEED", 400, 50)
         # Number of newest unsummarized items considered per feed when generating summaries
         self.SUMMARY_WINDOW_ITEMS = self._validate_positive_int("SUMMARY_WINDOW_ITEMS", 50, 10)
+        # Number of summaries per HTML bulletin chunk (controls backlog flushing)
+        self.BULLETIN_SUMMARY_LIMIT = self._validate_positive_int("BULLETIN_SUMMARY_LIMIT", 100, 10)
+        # Maximum number of summaries a single feed can contribute to one chunk (fairness guard)
+        self.BULLETIN_PER_FEED_LIMIT = self._validate_positive_int("BULLETIN_PER_FEED_LIMIT", 40, 5)
+        # Upper bound on sequential backlog chunks processed per run to prevent starvation
+        self.BULLETIN_MAX_CHUNKS = self._validate_positive_int("BULLETIN_MAX_CHUNKS", 5, 1)
+        # SimHash merging sensitivity (0 disables merging, higher tolerates more divergence)
+        try:
+            threshold = int(environ.get("SIMHASH_HAMMING_THRESHOLD", "4"))
+        except (ValueError, TypeError):
+            threshold = 4
+        if threshold < 0:
+            threshold = 0
+        self.SIMHASH_HAMMING_THRESHOLD = threshold
 
         # File size limits
         self.SCHEMA_FILE_SIZE_LIMIT_MB = self._validate_positive_int("SCHEMA_FILE_SIZE_LIMIT_MB", 10, 1)

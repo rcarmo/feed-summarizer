@@ -547,6 +547,7 @@ class FeedFetcher:
                     pub_date = int(time())
             except Exception:
                 pub_date = int(time())
+            title, url, guid = self._normalize_entry_identity(title, url, guid)
             
             raw_entries.append({
                 'entry': entry,
@@ -626,11 +627,36 @@ class FeedFetcher:
         processed_new_items = 0
         skipped_existing_items = 0
         skipped_outside_window = 0
+        bootstrap_allowed_items = 0
+        existing_guid_matches = 0
+        existing_url_matches = 0
         total_new_items = 0
+        outside_window_examples: List[str] = []
+        duplicate_examples: List[str] = []
+        new_entry_examples: List[str] = []
         
         # Calculate time window cutoff (items older than this will be skipped)
         time_window_seconds = config.TIME_WINDOW_HOURS * HOUR_IN_SECONDS
         cutoff_timestamp = int(time()) - time_window_seconds
+        logger.info(
+            "%s: evaluating %d entries (cutoff=%s, window=%sh, initial_fetch=%s)",
+            slug,
+            len(raw_entries),
+            self._format_timestamp(cutoff_timestamp),
+            config.TIME_WINDOW_HOURS,
+            is_initial_fetch,
+        )
+        if raw_entries:
+            newest_entry = max(raw_entries, key=lambda entry: entry['pub_date'])
+            oldest_entry = min(raw_entries, key=lambda entry: entry['pub_date'])
+            span_hours = (newest_entry['pub_date'] - oldest_entry['pub_date']) / HOUR_IN_SECONDS
+            logger.info(
+                "%s: entry timespan %s → %s (≈%.1fh)",
+                slug,
+                self._format_timestamp(oldest_entry['pub_date']),
+                self._format_timestamp(newest_entry['pub_date']),
+                span_hours,
+            )
         
         # For initial fetch, preselect the most recent items eligible for bootstrap regardless of time window
         bootstrap_guids: Set[str] = set()
@@ -655,21 +681,23 @@ class FeedFetcher:
             allow_bootstrap = is_initial_fetch and guid in bootstrap_guids
             if not is_recent_enough and not allow_bootstrap:
                 skipped_outside_window += 1
-                logger.debug(
-                    "Skipping item outside time window: %s (published %s, cutoff %s)",
-                    title,
-                    pub_date,
-                    cutoff_timestamp,
-                )
+                if len(outside_window_examples) < 5:
+                    outside_window_examples.append(
+                        f"{title[:80]} @ {self._format_timestamp(pub_date)}"
+                    )
                 continue
             if allow_bootstrap and not is_recent_enough:
-                logger.debug("Allowing item outside time window for initial fetch: %s", title)
+                bootstrap_allowed_items += 1
             
             # Only apply reader mode if this is a new item
             # New if neither GUID exists for this feed nor URL exists globally
-            is_new_item = (guid not in existing_guids) and (url not in existing_urls_global)
-            if not is_new_item and url in existing_urls_global and guid not in existing_guids:
-                logger.debug(f"Cross-feed duplicate URL detected (already stored under another feed): {url}")
+            guid_known = guid in existing_guids
+            url_known_global = url in existing_urls_global
+            is_new_item = not (guid_known or url_known_global)
+            if not is_new_item and url_known_global and not guid_known and len(duplicate_examples) < 5:
+                duplicate_examples.append(
+                    f"{title[:80]} (url dup) @ {self._format_timestamp(pub_date)}"
+                )
             
             if reader_mode and is_new_item:
                 try:
@@ -702,9 +730,9 @@ class FeedFetcher:
             if is_new_item:
                 processed_new_items += 1
                 # Limit field sizes for database safety
-                title = title[:255] if title else "No Title"  # Truncate long titles
-                url = url[:2048] if url else ""              # Reasonable URL length limit
-                guid = guid[:64] if guid else ""             # MD5 is 32 chars, but allow for longer IDs
+                title = title[:255] if title else "No Title"  # Truncate long titles (safety)
+                url = url[:2048] if url else ""              # Reasonable URL length limit (safety)
+                guid = guid[:64] if guid else ""             # MD5 is 32 chars, but allow for longer IDs (safety)
                 # Don't store empty bodies
                 if not body or len(body.strip()) == 0:
                     body = "<p>No content available</p>"
@@ -716,9 +744,18 @@ class FeedFetcher:
                     'body': body,
                     'date': pub_date
                 })
+                if len(new_entry_examples) < 5:
+                    new_entry_examples.append(f"{title[:80]} @ {self._format_timestamp(pub_date)}")
             else:
                 skipped_existing_items += 1
-                logger.debug(f"Skipping database save for existing item: {title}")
+                if guid_known:
+                    existing_guid_matches += 1
+                if url_known_global:
+                    existing_url_matches += 1
+                if len(duplicate_examples) < 5 and not url_known_global:
+                    duplicate_examples.append(
+                        f"{title[:80]} (guid dup) @ {self._format_timestamp(pub_date)}"
+                    )
             
             # Save in batches to prevent data loss in case of interruption
             if len(entries_data) >= config.SAVE_BATCH_SIZE or i == len(raw_entries) - 1:
@@ -727,13 +764,31 @@ class FeedFetcher:
                     total_new_items += new_items
                     logger.info(f"Saved batch of {len(entries_data)} NEW entries from {slug}")
                     entries_data = []  # Reset for next batch
-        
-            # Log reader mode statistics
-            if reader_mode:
-                logger.info(f"Applied reader mode to {reader_mode_count} new items from {slug}")
-            
-            logger.info(f"Processed {processed_new_items} new items, skipped {skipped_existing_items} existing items, and skipped {skipped_outside_window} items outside time window from {slug}")
-
+        if entries_data:
+            new_items = await self.db.execute('save_items', feed_id=feed_id, entries_data=entries_data)
+            total_new_items += new_items
+            logger.info(f"Saved final batch of {len(entries_data)} NEW entries from {slug}")
+            entries_data = []
+        if reader_mode:
+            logger.info(f"Applied reader mode to {reader_mode_count} new items from {slug}")
+        logger.info(
+            "%s summary: processed=%d new_candidates=%d saved=%d existing=%d (guid=%d url=%d) outside_window=%d bootstrap=%d",
+            slug,
+            len(raw_entries),
+            processed_new_items,
+            total_new_items,
+            skipped_existing_items,
+            existing_guid_matches,
+            existing_url_matches,
+            skipped_outside_window,
+            bootstrap_allowed_items,
+        )
+        if outside_window_examples:
+            logger.info("%s outside-window samples: %s", slug, "; ".join(outside_window_examples))
+        if duplicate_examples:
+            logger.info("%s duplicate samples: %s", slug, "; ".join(duplicate_examples))
+        if new_entry_examples:
+            logger.info("%s new entry samples: %s", slug, "; ".join(new_entry_examples))
         return total_new_items
 
     @trace_span(
@@ -1338,6 +1393,32 @@ class FeedFetcher:
         if message:
             parts.append(message)
         return " ".join(parts)
+
+    def _format_timestamp(self, timestamp: Optional[int]) -> str:
+        """Return a human-readable UTC timestamp for diagnostics."""
+        if timestamp in (None, ""):
+            return "n/a"
+        try:
+            return datetime.fromtimestamp(int(timestamp), tz=timezone.utc).isoformat()
+        except (OSError, OverflowError, ValueError, TypeError):
+            return str(timestamp)
+
+    def _normalize_entry_identity(self, title: Optional[str], url: Optional[str], guid: Optional[str]) -> tuple[str, str, str]:
+        """Apply the same normalization used for storage so dedup logic stays consistent."""
+        norm_title = (title or "No Title").strip()
+        if not norm_title:
+            norm_title = "No Title"
+        norm_title = norm_title[:255]
+
+        norm_url = (url or "").strip()
+        if norm_url:
+            norm_url = norm_url[:2048]
+
+        norm_guid = (guid or "").strip()
+        if norm_guid:
+            norm_guid = norm_guid[:64]
+
+        return norm_title, norm_url, norm_guid
 
 
 @trace_span("fetcher.main_loop", tracer_name="fetcher")

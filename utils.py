@@ -7,6 +7,8 @@ including rate limiting, common validation functions, and other helper utilities
 """
 
 from asyncio import Lock, sleep
+from collections import Counter
+from hashlib import blake2b
 from time import time
 from typing import Optional
 import re
@@ -282,3 +284,74 @@ def clean_html_to_markdown(html_content: str, base_url: Optional[str] = None) ->
     except Exception as e:
         logger.error(f"Error cleaning HTML to Markdown: {e}")
         return html_content
+
+
+INT64_MASK = (1 << 64) - 1
+
+
+def encode_int64(value: Optional[int]) -> Optional[int]:
+    """Encode an unsigned 64-bit value into SQLite-compatible signed range."""
+    if value is None:
+        return None
+    masked = value & INT64_MASK
+    if masked >= (1 << 63):
+        masked -= 1 << 64
+    return masked
+
+
+def decode_int64(value: Optional[int]) -> Optional[int]:
+    """Decode a signed SQLite integer back into the original 64-bit value."""
+    if value is None:
+        return None
+    return value & INT64_MASK
+
+
+def compute_simhash(text: Optional[str], hash_bits: int = 64) -> Optional[int]:
+    """Compute a lightweight SimHash fingerprint for the provided text."""
+    if not text:
+        return None
+    tokens = re.findall(r"\w+", text.lower())
+    if not tokens:
+        return None
+    freq = Counter(tokens)
+    bits = max(8, hash_bits)
+    if bits % 8 != 0:
+        bits -= bits % 8
+    digest_size = bits // 8
+    if digest_size <= 0:
+        return None
+    vector = [0] * bits
+    for token, weight in freq.items():
+        try:
+            digest = blake2b(token.encode('utf-8'), digest_size=digest_size).digest()
+        except Exception:
+            continue
+        value = int.from_bytes(digest, 'big')
+        for bit in range(bits):
+            if value & (1 << bit):
+                vector[bit] += weight
+            else:
+                vector[bit] -= weight
+    fingerprint = 0
+    for bit, score in enumerate(vector):
+        if score > 0:
+            fingerprint |= (1 << bit)
+    return fingerprint if fingerprint != 0 else None
+
+
+def hamming_distance(value_a: Optional[int], value_b: Optional[int], bits: int = 64) -> Optional[int]:
+    """Compute the Hamming distance between two integer fingerprints."""
+    if value_a is None or value_b is None:
+        return None
+    mask_bits = max(1, bits)
+    mask = (1 << mask_bits) - 1
+    diff = (value_a ^ value_b) & mask
+    try:
+        return diff.bit_count()
+    except AttributeError:
+        # Python <3.8 fallback (unlikely, but keeps helper defensive)
+        count = 0
+        while diff:
+            diff &= diff - 1
+            count += 1
+        return count

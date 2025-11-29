@@ -24,7 +24,7 @@ from config import config, get_logger
 from llm_client import chat_completion as ai_chat_completion
 from telemetry import init_telemetry, get_tracer, trace_span
 from models import DatabaseQueue
-from utils import RateLimiter, RetryHelper
+from utils import RateLimiter, RetryHelper, compute_simhash, encode_int64
 
 # Module-specific logger
 logger = get_logger("summarizer")
@@ -416,7 +416,7 @@ class NewsProcessor:
         tracer_name="summarizer",
         attr_from_args=lambda self, items_subset, session, url_ids: {"items.count": len(items_subset) if items_subset is not None else 0},
     )
-    async def _summarize_items_subset(self, items_subset: List[Dict[str, Any]], session: ClientSession, url_ids: Dict[int, str]) -> Tuple[str, List[Any], Dict[Any, Tuple[str, str]]]:
+    async def _summarize_items_subset(self, items_subset: List[Dict[str, Any]], session: ClientSession, url_ids: Dict[int, str]) -> Tuple[str, List[Any], Dict[Any, Tuple[str, str, Optional[int]]]]:
         """Summarize a subset of items. May raise ContentFilterError. Returns markdown, seen_ids, summaries_dict."""
         prompt_text = self.make_groups_of_key_value_pairs(items_subset)
         json_content = await self.call_azure_openai(prompt_text, session)
@@ -434,7 +434,7 @@ class NewsProcessor:
         tracer_name="summarizer",
         attr_from_args=lambda self, items_subset, session, url_ids: {"items.count": len(items_subset) if items_subset is not None else 0},
     )
-    async def _bisect_summarize(self, items_subset: List[Dict[str, Any]], session: ClientSession, url_ids: Dict[int, str]) -> Tuple[str, List[Any], Dict[Any, Tuple[str, str]], List[Any]]:
+    async def _bisect_summarize(self, items_subset: List[Dict[str, Any]], session: ClientSession, url_ids: Dict[int, str]) -> Tuple[str, List[Any], Dict[Any, Tuple[str, str, Optional[int]]], List[Any]]:
         """Recursively bisect items to avoid content filter. Returns markdown, summarized_ids, summaries_dict, filtered_ids."""
         n = len(items_subset)
         if n == 0:
@@ -466,7 +466,7 @@ class NewsProcessor:
             merged_filt = filt_l + filt_r
             return merged_md, merged_ids, merged_sums, merged_filt
 
-    async def group_by_topic_and_generate_markdown(self, json_content: str, url_ids: Dict[int, str]) -> Tuple[str, List[Any], Dict[Any, Tuple[str, str]]]:
+    async def group_by_topic_and_generate_markdown(self, json_content: str, url_ids: Dict[int, str]) -> Tuple[str, List[Any], Dict[Any, Tuple[str, str, Optional[int]]]]:
         """Parse JSON and generate markdown grouped by topic."""
         try:
             # Log the raw response for debugging
@@ -537,8 +537,14 @@ class NewsProcessor:
                 item['id'] = original_id
                 topics[topic].append(item)
                 
-                # Store the summary text and topic for database insertion
-                summaries_dict[original_id] = (item.get('summary', ''), topic)
+                # Store the summary text, topic, and simhash fingerprint for database insertion
+                summary_text = item.get('summary', '')
+                simhash_value = compute_simhash(summary_text) if summary_text else None
+                summaries_dict[original_id] = (
+                    summary_text,
+                    topic,
+                    encode_int64(simhash_value) if simhash_value is not None else None,
+                )
             
             # Generate markdown
             markdown = ""

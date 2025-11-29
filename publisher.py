@@ -8,6 +8,7 @@ published within a 4-hour time window, with AI-generated introductions.
 """
 
 from typing import Dict, List, Optional, Tuple, Any
+from collections import Counter
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import yaml
@@ -31,6 +32,7 @@ from config import config, get_logger
 from telemetry import init_telemetry, get_tracer, trace_span
 from llm_client import chat_completion as ai_chat_completion
 from models import DatabaseQueue
+from utils import hamming_distance
 
 # Module-specific logger
 logger = get_logger("publisher")
@@ -233,6 +235,14 @@ class RSSPublisher:
         title = re.sub(r'<[^>]+>', ' ', m.group(1))
         title = re.sub(r'\s+', ' ', title).strip()
         return title or None
+
+    def _compute_per_feed_limit(self, feed_slugs: List[str]) -> int:
+        """Compute how many summaries each feed can contribute to a single bulletin chunk."""
+        if not feed_slugs:
+            return max(1, config.BULLETIN_PER_FEED_LIMIT)
+        dynamic = max(1, config.BULLETIN_SUMMARY_LIMIT // max(1, len(feed_slugs)))
+        per_feed = min(config.BULLETIN_PER_FEED_LIMIT, dynamic)
+        return max(1, per_feed)
 
     def _sanitize_xml_string(self, text: str) -> str:
         """Sanitize a string for XML output by removing control characters and NULL bytes."""
@@ -463,96 +473,295 @@ class RSSPublisher:
         if not feed_slugs:
             return {}
         
+        # First, try to get existing bulletins for this specific group
+        logger.debug(f"Looking for cached bulletins for group '{group_name}'")
+        
+        bulletins_found = {}
         try:
-            # First, try to get existing bulletins for this specific group
-            logger.debug(f"Looking for cached bulletins for group '{group_name}'")
+            bulletins = await self.db.execute('get_bulletins_for_group', group_name=group_name, days_back=days_back)
             
-            bulletins_found = {}
-            try:
-                bulletins = await self.db.execute('get_bulletins_for_group', group_name=group_name, days_back=days_back)
+            for bulletin_meta in bulletins or []:
+                session_key = bulletin_meta['session_key']
                 
-                for bulletin_meta in bulletins or []:
-                    session_key = bulletin_meta['session_key']
-                    
-                    # Get full bulletin data with summaries
-                    bulletin_data = await self.db.execute('get_bulletin', 
-                                                        group_name=group_name, 
-                                                        session_key=session_key)
-                    
-                    if bulletin_data and bulletin_data.get('summaries'):
-                        bulletins_found[session_key] = bulletin_data['summaries']
-                        logger.debug(f"Found cached bulletin for {group_name}/{session_key} with {len(bulletin_data['summaries'])} summaries")
-            
-            except Exception as e:
-                logger.warning(f"Error loading bulletins for group {group_name}: {e}")
-            
-            # If we found bulletins, return them
-            if bulletins_found:
-                logger.info(f"Using {len(bulletins_found)} cached bulletins for group '{group_name}'")
-                return bulletins_found
-            
-            # Fallback: Generate bulletins from raw summaries (old behavior)
-            logger.info(f"No cached bulletins found for group '{group_name}', generating from raw summaries for: {feed_slugs}")
-            
-            # Calculate cutoff time (days_back days ago)
-            cutoff_time = int((datetime.now(timezone.utc) - timedelta(days=days_back)).timestamp())
-            
-            summaries = await self.db.execute(
-                'query_published_summaries_by_date', 
-                feed_slugs=feed_slugs, 
-                cutoff_time=cutoff_time
-            )
-            
-            # Group summaries by exact publication timestamp (publishing session)
-            grouped = {}
-            for summary in summaries or []:
-                if summary['published_date']:
-                    # Convert timestamp to datetime
-                    pub_date = datetime.fromtimestamp(summary['published_date'], tz=timezone.utc)
-                    
-                    # Create session key based on exact publication time (to nearest minute)
-                    # This groups summaries published in the same batch/session
-                    session_key = pub_date.strftime('%Y-%m-%d-%H-%M')
-                    
-                    if session_key not in grouped:
-                        grouped[session_key] = []
-                    grouped[session_key].append(summary)
-            
-            # If we have only one large session, split it into smaller bulletins
-            # to avoid having hundreds of summaries in a single RSS item
-            max_summaries_per_item = 25  # Maximum summaries per RSS item (increased for better content grouping)
-            final_grouped = {}
-            
-            for session_key, session_summaries in grouped.items():
-                if len(session_summaries) <= max_summaries_per_item:
-                    # Small session, keep as is
-                    final_grouped[session_key] = session_summaries
-                else:
-                    # Large session, split into multiple bulletins
-                    for i in range(0, len(session_summaries), max_summaries_per_item):
-                        chunk = session_summaries[i:i + max_summaries_per_item]
-                        chunk_key = f"{session_key}-{i//max_summaries_per_item + 1}"
-                        final_grouped[chunk_key] = chunk
-            
-            return final_grouped
-            
+                # Get full bulletin data with summaries
+                bulletin_data = await self.db.execute('get_bulletin', 
+                                                    group_name=group_name, 
+                                                    session_key=session_key)
+                
+                if bulletin_data and bulletin_data.get('summaries'):
+                    bulletins_found[session_key] = bulletin_data['summaries']
+                    logger.debug(f"Found cached bulletin for {group_name}/{session_key} with {len(bulletin_data['summaries'])} summaries")
+        
         except Exception as e:
-            logger.error(f"Error querying published summaries by date for group '{group_name}' with feeds {feed_slugs}: {e}")
-            return {}
+            logger.warning(f"Error loading bulletins for group {group_name}: {e}")
+        
+        # If we found bulletins, return them
+        if bulletins_found:
+            logger.info(f"Using {len(bulletins_found)} cached bulletins for group '{group_name}'")
+            return bulletins_found
+        
+        # Fallback: Generate bulletins from raw summaries (old behavior)
+        logger.info(f"No cached bulletins found for group '{group_name}', generating from raw summaries for: {feed_slugs}")
+        
+        # Calculate cutoff time (days_back days ago)
+        cutoff_time = int((datetime.now(timezone.utc) - timedelta(days=days_back)).timestamp())
+        
+        summaries = await self.db.execute(
+            'query_published_summaries_by_date', 
+            feed_slugs=feed_slugs, 
+            cutoff_time=cutoff_time
+        )
+        
+        # Group summaries by exact publication timestamp (publishing session)
+        grouped = {}
+        for summary in summaries or []:
+            if summary['published_date']:
+                # Convert timestamp to datetime
+                pub_date = datetime.fromtimestamp(summary['published_date'], tz=timezone.utc)
+                
+                # Create session key based on exact publication time (to nearest minute)
+                # This groups summaries published in the same batch/session
+                session_key = pub_date.strftime('%Y-%m-%d-%H-%M')
+                
+                if session_key not in grouped:
+                    grouped[session_key] = []
+                grouped[session_key].append(summary)
+        
+        # If we have only one large session, split it into smaller bulletins
+        # to avoid having hundreds of summaries in a single RSS item
+        max_summaries_per_item = 25  # Maximum summaries per RSS item (increased for better content grouping)
+        final_grouped = {}
+        
+        for session_key, session_summaries in grouped.items():
+            if len(session_summaries) <= max_summaries_per_item:
+                # Small session, keep as is
+                final_grouped[session_key] = session_summaries
+            else:
+                # Large session, split into multiple bulletins
+                for i in range(0, len(session_summaries), max_summaries_per_item):
+                    chunk = session_summaries[i:i + max_summaries_per_item]
+                    chunk_key = f"{session_key}-{i//max_summaries_per_item + 1}"
+                    final_grouped[chunk_key] = chunk
+        
+        return final_grouped
 
-    async def get_latest_summaries_for_feeds(self, feed_slugs: List[str], limit: int = 50) -> List[Dict[str, Any]]:
+    async def get_latest_summaries_for_feeds(self, feed_slugs: List[str], limit: int = 50, per_feed_limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """Get the latest unpublished summaries for specified feeds (for HTML generation)."""
         if not feed_slugs:
             return []
-        
+
+        summaries = await self.db.execute(
+            'query_summaries_for_feeds',
+            feed_slugs=feed_slugs,
+            limit=limit,
+            per_feed_limit=per_feed_limit,
+        )
+        return summaries or []
+
+    def _summary_id_list(self, summary: Dict[str, Any]) -> List[int]:
+        """Return the list of source summary IDs represented by this entry."""
+        merged_ids = summary.get('merged_ids')
+        if merged_ids:
+            return [int(i) for i in merged_ids if isinstance(i, (int, str))]
+        sid = summary.get('id')
+        return [int(sid)] if isinstance(sid, (int, str)) else []
+
+    def _collect_summary_links(self, summary: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Return list of link descriptors for a summary (merged aware)."""
+        links = summary.get('merged_links') or []
+        collected: List[Dict[str, Any]] = []
+        seen: set = set()
+        for link in links:
+            url = (link or {}).get('url')
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            collected.append({
+                'url': url,
+                'title': link.get('title') or summary.get('item_title') or summary.get('title') or 'Read more',
+                'feed_slug': link.get('feed_slug') or summary.get('feed_slug'),
+            })
+        if collected:
+            return collected
+        fallback_url = summary.get('item_url') or summary.get('url')
+        if fallback_url:
+            collected.append({
+                'url': fallback_url,
+                'title': summary.get('item_title') or summary.get('title') or 'Read more',
+                'feed_slug': summary.get('feed_slug'),
+            })
+        return collected
+
+    async def _synthesize_merged_summary(
+        self,
+        group: List[Dict[str, Any]],
+        prompt_template: str,
+        use_llm: bool,
+    ) -> str:
+        """Build a merged summary text for a cluster of similar summaries."""
+        fallback_parts = [g.get('summary_text', '').strip() for g in group if g.get('summary_text')]
+        fallback_text = '; '.join([part for part in fallback_parts if part])
+        if len(fallback_text) > 1000:
+            fallback_text = fallback_text[:1000]
+        if not use_llm or not prompt_template:
+            return fallback_text
+
+        payload_lines = ["Summaries:"]
+        for member in group:
+            payload_lines.append(f"ID: {member.get('id')}")
+            text = (member.get('summary_text') or '').strip()
+            if text:
+                payload_lines.append(f"Summary: {text[:600]}")
+            payload_lines.append("")
+        formatted_prompt = f"{prompt_template}\n\n" + "\n".join(payload_lines).strip()
+        messages = [{"role": "user", "content": formatted_prompt}]
         try:
-            # Use the database method to query summaries
-            summaries = await self.db.execute('query_summaries_for_feeds', feed_slugs=feed_slugs, limit=limit)
-            return summaries or []
-            
-        except Exception as e:
-            logger.error(f"Error querying summaries for feeds {feed_slugs}: {e}")
-            return []
+            response = await ai_chat_completion(messages, purpose="similar_merge")
+            if not response:
+                return fallback_text
+            parsed = json.loads(response)
+            if isinstance(parsed, list) and parsed:
+                merged_summary = parsed[0].get('summary')
+                if merged_summary:
+                    return merged_summary.strip()
+        except Exception as exc:
+            ids = [member.get('id') for member in group]
+            logger.warning("similar_merge prompt failed for ids %s: %s", ids, exc)
+        return fallback_text
+
+    def _build_merge_links(self, group: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Collect deduplicated links for a merged summary group."""
+        links: List[Dict[str, Any]] = []
+        seen_urls: set = set()
+        for member in group:
+            url = member.get('item_url') or member.get('url')
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            links.append({
+                'url': url,
+                'title': member.get('item_title') or member.get('title') or 'Read more',
+                'feed_slug': member.get('feed_slug'),
+            })
+        return links
+
+    def _choose_merge_topic(self, group: List[Dict[str, Any]]) -> str:
+        """Pick the predominant topic for a merged summary group."""
+        topics = [g.get('topic') or 'General' for g in group]
+        if not topics:
+            return 'General'
+        return Counter(topics).most_common(1)[0][0]
+
+    async def _merge_similar_summaries(self, summaries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Merge highly similar summaries using SimHash + optional LLM prompt."""
+        threshold = max(0, int(getattr(config, 'SIMHASH_HAMMING_THRESHOLD', 0) or 0))
+        if threshold <= 0 or not summaries:
+            return summaries
+
+        candidates = [s for s in summaries if isinstance(s.get('simhash'), int) and isinstance(s.get('id'), (int, str))]
+        if len(candidates) < 2:
+            return summaries
+
+        # Union-find setup keyed by summary ID (as int)
+        def _as_int(value: Any) -> Optional[int]:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        index_map = {}
+        parent: Dict[int, int] = {}
+        for idx, summary in enumerate(summaries):
+            sid = _as_int(summary.get('id'))
+            if sid is None:
+                continue
+            index_map[sid] = idx
+            parent.setdefault(sid, sid)
+
+        def find(node: int) -> int:
+            parent.setdefault(node, node)
+            if parent[node] != node:
+                parent[node] = find(parent[node])
+            return parent[node]
+
+        def union(a: int, b: int) -> None:
+            root_a = find(a)
+            root_b = find(b)
+            if root_a == root_b:
+                return
+            idx_a = index_map.get(root_a, 0)
+            idx_b = index_map.get(root_b, 0)
+            if idx_a <= idx_b:
+                parent[root_b] = root_a
+            else:
+                parent[root_a] = root_b
+
+        for i in range(len(candidates)):
+            for j in range(i + 1, len(candidates)):
+                first = candidates[i]
+                second = candidates[j]
+                sid_a = _as_int(first.get('id'))
+                sid_b = _as_int(second.get('id'))
+                if sid_a is None or sid_b is None:
+                    continue
+                dist = hamming_distance(first.get('simhash'), second.get('simhash'))
+                if dist is not None and dist <= threshold:
+                    union(sid_a, sid_b)
+
+        cluster_map: Dict[int, List[Dict[str, Any]]] = {}
+        for summary in candidates:
+            sid = _as_int(summary.get('id'))
+            if sid is None:
+                continue
+            root = find(sid)
+            cluster_map.setdefault(root, []).append(summary)
+
+        merge_groups = [group for group in cluster_map.values() if len(group) > 1]
+        if not merge_groups:
+            return summaries
+
+        prompt_template = (self.prompts.get('similar_merge') or '').strip()
+        use_llm = bool(prompt_template and config.AZURE_ENDPOINT and config.OPENAI_API_KEY)
+
+        aggregated_entries: Dict[int, Dict[str, Any]] = {}
+        membership: Dict[int, int] = {}
+        for group in merge_groups:
+            leader = min(group, key=lambda g: index_map.get(_as_int(g.get('id')), float('inf')))
+            leader_id = _as_int(leader.get('id'))
+            if leader_id is None:
+                continue
+            merged_ids = [_as_int(member.get('id')) for member in group if _as_int(member.get('id')) is not None]
+            merged_text = await self._synthesize_merged_summary(group, prompt_template, use_llm)
+            merged_entry = dict(leader)
+            merged_entry['summary_text'] = merged_text or leader.get('summary_text')
+            merged_entry['topic'] = self._choose_merge_topic(group)
+            merged_entry['merged_ids'] = merged_ids
+            merged_entry['merged_links'] = self._build_merge_links(group)
+            merged_entry['merged_count'] = len(group)
+            aggregated_entries[leader_id] = merged_entry
+            for member in group:
+                sid = _as_int(member.get('id'))
+                if sid is not None:
+                    membership[sid] = leader_id
+            logger.info(
+                "Merged %d summaries into leader %s (threshold=%d)",
+                len(group),
+                leader_id,
+                threshold,
+            )
+
+        merged_output: List[Dict[str, Any]] = []
+        for summary in summaries:
+            sid = _as_int(summary.get('id'))
+            if sid is not None and sid in membership:
+                leader_id = membership[sid]
+                if sid != leader_id:
+                    continue  # Non-leader member -> skip (already represented)
+                merged_output.append(aggregated_entries.get(leader_id, summary))
+            else:
+                merged_output.append(summary)
+
+        return merged_output
 
     async def mark_summaries_as_published(self, summary_ids: List[int]) -> int:
         """Mark summaries as published by updating the published_date in the database."""
@@ -575,27 +784,28 @@ class RSSPublisher:
         shared markdown helpers expect 'title' and 'url'. Perform a lightweight projection
         to the expected shape to avoid KeyError 'title'.
         """
-        projected: List[Dict[str, Any]] = []
-        for s in summaries:
-            try:
-                projected.append({
-                    'title': s.get('item_title') or s.get('title') or 'Untitled',
-                    'url': s.get('item_url') or s.get('url') or '',
-                    'topic': s.get('topic', 'General')
-                })
-            except Exception:
-                # Skip any summary that can't be coerced
-                continue
         topics: Dict[str, List[Dict[str, Any]]] = {}
-        for entry in projected:
-            topic = entry.get('topic', 'General')
-            topics.setdefault(topic, []).append(entry)
+        for summary in summaries:
+            topic = summary.get('topic', 'General') or 'General'
+            topics.setdefault(topic, []).append(summary)
 
         markdown_lines: List[str] = []
         for topic, items in topics.items():
             markdown_lines.append(f"\n## {topic}\n")
             for item in items:
-                markdown_lines.append(f"- {item['title']} ({item['url']})")
+                title = item.get('item_title') or item.get('title') or 'Untitled'
+                links = self._collect_summary_links(item)
+                if not links:
+                    markdown_lines.append(f"- {title}")
+                    continue
+                if len(links) == 1:
+                    markdown_lines.append(f"- {title} ([link]({links[0]['url']}))")
+                    continue
+                link_parts = []
+                for idx, link in enumerate(links, start=1):
+                    label = f"{idx}"
+                    link_parts.append(f"[{label}]({link['url']})")
+                markdown_lines.append(f"- {title} ({', '.join(link_parts)})")
         return "\n".join(markdown_lines)
 
     @trace_span(
@@ -745,13 +955,22 @@ class RSSPublisher:
             
             for summary in topic_summaries:
                 summary_text = summary.get('summary_text', '').strip()
-                item_url = summary.get('item_url', '')
-                
-                if summary_text:
-                    if item_url:
-                        content_parts.append(f'<li>{summary_text} (<a href="{item_url}">link</a>)</li>')
-                    else:
-                        content_parts.append(f'<li>{summary_text}</li>')
+                links = self._collect_summary_links(summary)
+                if not summary_text:
+                    continue
+                if links:
+                    link_html = []
+                    link_count = len(links)
+                    for idx, link in enumerate(links, start=1):
+                        href = link.get('url')
+                        if not href:
+                            continue
+                        # Use neutral labels to keep formatting consistent with markdown output
+                        label = "link" if link_count == 1 else str(idx)
+                        link_html.append(f'<a href="{href}">{label}</a>')
+                    content_parts.append(f'<li>{summary_text} ({"; ".join(link_html)})</li>')
+                else:
+                    content_parts.append(f'<li>{summary_text}</li>')
             
             content_parts.append("</ul>")
         
@@ -862,8 +1081,13 @@ class RSSPublisher:
         try:
             logger.info(f"Publishing RSS feed for group '{group_name}' with feeds: {feed_slugs}")
             
-            # Get published summaries grouped by publishing sessions (last 7 days for processing, but we'll filter to retention period)
-            bulletins = await self.get_published_summaries_by_date(group_name, feed_slugs, days_back=7)
+            # Get published summaries grouped by publishing sessions within retention window
+            bulletin_window_days = max(1, int(self.retention_days))
+            bulletins = await self.get_published_summaries_by_date(
+                group_name,
+                feed_slugs,
+                days_back=bulletin_window_days,
+            )
             
             # Filter bulletins to retention period
             cutoff_date = datetime.now(timezone.utc) - timedelta(days=self.retention_days)
@@ -887,6 +1111,10 @@ class RSSPublisher:
                     logger.warning(f"Could not parse session key '{session_key}': {e}")
                     # Include it anyway to be safe
                     filtered_bulletins[session_key] = summaries
+
+            # Merge similar summaries within each session prior to rendering
+            for session_key, summaries in list(filtered_bulletins.items()):
+                filtered_bulletins[session_key] = await self._merge_similar_summaries(summaries)
             
             if not filtered_bulletins:
                 logger.info(f"No recent bulletins found for group '{group_name}' within {self.retention_days} days")
@@ -930,7 +1158,9 @@ class RSSPublisher:
                                 
                                 # Cache the introduction in the database for future use
                                 try:
-                                    summary_ids = [s['id'] for s in summaries]
+                                    summary_ids: List[int] = []
+                                    for summary in summaries:
+                                        summary_ids.extend(self._summary_id_list(summary))
                                     await self.db.execute('create_bulletin',
                                                         group_name=group_name,
                                                         session_key=session_key,
@@ -1273,6 +1503,310 @@ class RSSPublisher:
             logger.error(f"Error cleaning up old bulletins: {e}")
             return 0
 
+    async def _process_bulletin_chunk(
+        self,
+        group_name: str,
+        feed_slugs: List[str],
+        summaries: List[Dict[str, Any]],
+        enable_intro: bool,
+        render_html: bool,
+        chunk_index: int,
+    ) -> int:
+        """Render/write/capture a single bulletin chunk and persist metadata."""
+        if not summaries:
+            return 0
+
+        summaries = await self._merge_similar_summaries(summaries)
+
+        # Normalize date fields to datetime objects for template safety
+        for s in summaries:
+            try:
+                d = s.get('item_date')
+                if d:
+                    if hasattr(d, 'strftime'):
+                        continue
+                    if isinstance(d, (int, float)):
+                        s['item_date'] = datetime.fromtimestamp(int(d), tz=timezone.utc)
+                        continue
+                    if isinstance(d, str):
+                        ds = d.strip()
+                        ds_try = ds[:-1] if ds.endswith('Z') else ds
+                        parsed = None
+                        for fmt in ('%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S'):
+                            try:
+                                parsed = datetime.strptime(ds_try, fmt).replace(tzinfo=timezone.utc)
+                                break
+                            except Exception:
+                                continue
+                        if not parsed:
+                            try:
+                                parsed = datetime.fromisoformat(ds_try)
+                                if parsed.tzinfo is None:
+                                    parsed = parsed.replace(tzinfo=timezone.utc)
+                            except Exception:
+                                parsed = None
+                        s['item_date'] = parsed
+                    else:
+                        s['item_date'] = None
+            except Exception:
+                try:
+                    s['item_date'] = None
+                except Exception:
+                    pass
+
+        # Diagnostics: log distribution by topic and by feed
+        try:
+            by_topic = {}
+            by_feed = {}
+            for s in summaries:
+                t = s.get('topic') or 'General'
+                by_topic[t] = by_topic.get(t, 0) + 1
+                f = s.get('feed_slug') or ''
+                if f:
+                    by_feed[f] = by_feed.get(f, 0) + 1
+            topic_info = ", ".join([f"{k}:{v}" for k, v in sorted(by_topic.items())])
+            feed_info = ", ".join([f"{k}:{v}" for k, v in sorted(by_feed.items())])
+            logger.info(
+                "Bulletin '%s' chunk #%d includes %d summaries across %d topic(s): %s",
+                group_name,
+                chunk_index + 1,
+                len(summaries),
+                len(by_topic),
+                topic_info,
+            )
+            if by_feed:
+                logger.debug("Bulletin '%s' chunk #%d feed distribution: %s", group_name, chunk_index + 1, feed_info)
+            if len(by_topic) == 1 and len(summaries) <= 2:
+                logger.warning(
+                    "Bulletin '%s' chunk #%d appears small (topics=%d, items=%d).",
+                    group_name,
+                    chunk_index + 1,
+                    len(by_topic),
+                    len(summaries),
+                )
+        except Exception:
+            pass
+
+        # Generate AI introduction and title if configured
+        introduction: Optional[str] = None
+        ai_title: Optional[str] = None
+        if enable_intro and config.AZURE_ENDPOINT and config.OPENAI_API_KEY:
+            try:
+                markdown_bulletin = self._generate_markdown_bulletin(summaries)
+                async with ClientSession() as session:
+                    introduction = await self._generate_ai_introduction(markdown_bulletin, session)
+                    if introduction:
+                        logger.info(
+                            "Generated AI introduction for '%s' chunk #%d (%d characters)",
+                            group_name,
+                            chunk_index + 1,
+                            len(introduction),
+                        )
+                    else:
+                        logger.warning("Failed to generate AI introduction for '%s' chunk #%d", group_name, chunk_index + 1)
+                    ai_title = await self._generate_ai_title(markdown_bulletin, session)
+                    if ai_title:
+                        logger.info(
+                            "Generated AI title for '%s' chunk #%d: '%s'",
+                            group_name,
+                            chunk_index + 1,
+                            ai_title[:120],
+                        )
+                    else:
+                        logger.warning(
+                            "Primary AI title attempt empty for '%s' chunk #%d; attempting fallback",
+                            group_name,
+                            chunk_index + 1,
+                        )
+                        try:
+                            condensed_titles = [
+                                (s.get('item_title') or s.get('title', '')).strip()
+                                for s in summaries
+                                if (s.get('item_title') or s.get('title'))
+                            ]
+                            condensed = "\n".join(condensed_titles[:8])
+                            if condensed:
+                                alt_prompt = f"Generate a concise bulletin title summarizing these article titles:\n{condensed}"
+                                async with ClientSession() as session_alt:
+                                    alt_messages = []
+                                    system_prompt = self.prompts.get('title_system') or self.prompts.get('system_title') or ''
+                                    if system_prompt:
+                                        alt_messages.append({"role": "system", "content": system_prompt})
+                                    alt_messages.append({"role": "user", "content": alt_prompt})
+                                    alt_title = await ai_chat_completion(
+                                        alt_messages,
+                                        purpose="title_alt",
+                                        postprocess=lambda r: r.splitlines()[0].strip(),
+                                    )
+                                    if alt_title:
+                                        ai_title = alt_title
+                        except Exception as e:
+                            logger.debug(f"Alternative AI title attempt failed for '{group_name}' chunk #{chunk_index + 1}: {e}")
+            except Exception as e:
+                logger.error(f"Error generating AI intro/title for '{group_name}' chunk #{chunk_index + 1}: {e}")
+        else:
+            if config.AZURE_ENDPOINT and config.OPENAI_API_KEY:
+                try:
+                    markdown_bulletin = self._generate_markdown_bulletin(summaries)
+                    async with ClientSession() as session:
+                        ai_title = await self._generate_ai_title(markdown_bulletin, session)
+                        if ai_title:
+                            logger.info(
+                                "Generated AI title for '%s' chunk #%d: '%s'",
+                                group_name,
+                                chunk_index + 1,
+                                ai_title[:120],
+                            )
+                except Exception as e:
+                    logger.error(f"Error generating AI title for '{group_name}' chunk #{chunk_index + 1}: {e}")
+
+        # Generate HTML content only for the freshest chunk (render_html flag)
+        final_title = ai_title
+        if not final_title:
+            try:
+                concat_titles = [
+                    (s.get('item_title') or s.get('title', '')).strip()
+                    for s in summaries
+                    if (s.get('item_title') or s.get('title'))
+                ]
+                if concat_titles:
+                    heuristic = ", ".join(concat_titles[:5])[:120]
+                    final_title = f"{group_name.title()}: {heuristic}".rstrip(' ,')
+            except Exception:
+                pass
+            if not final_title:
+                try:
+                    provisional_session_key = datetime.now(timezone.utc).strftime('%Y-%m-%d-%H-%M')
+                    final_title = self._generate_title_from_introduction(introduction or "", group_name, provisional_session_key)
+                except Exception:
+                    final_title = f"{group_name.title()} Bulletin"
+
+        if render_html:
+            html_content = self._generate_html_content(group_name, feed_slugs, summaries, introduction, final_title)
+            output_file = self.html_bulletins_dir / f"{group_name}.html"
+            with tempfile.NamedTemporaryFile(
+                mode='w',
+                encoding='utf-8',
+                suffix='.html',
+                dir=self.html_bulletins_dir,
+                delete=False,
+            ) as temp_file:
+                temp_file.write(html_content)
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+                temp_path = temp_file.name
+            shutil.move(temp_path, output_file)
+            logger.info(
+                "Wrote HTML bulletin for '%s' chunk #%d with %d summaries",
+                group_name,
+                chunk_index + 1,
+                len(summaries),
+            )
+
+        summary_ids: List[int] = []
+        for summary in summaries:
+            summary_ids.extend(self._summary_id_list(summary))
+        existing_bulletins = await self.db.execute(
+            'find_bulletin_sessions_for_summaries',
+            group_name=group_name,
+            summary_ids=summary_ids,
+        )
+        if existing_bulletins:
+            logger.info(
+                "Summaries for group '%s' chunk #%d already exist in %d bulletin(s) - skipping creation",
+                group_name,
+                chunk_index + 1,
+                len(existing_bulletins),
+            )
+            return 0
+
+        published_count = await self.mark_summaries_as_published(summary_ids)
+        if not summary_ids or published_count <= 0:
+            logger.warning(
+                "No bulletin created for '%s' chunk #%d - no summaries were marked as published",
+                group_name,
+                chunk_index + 1,
+            )
+            return 0
+
+        session_base = datetime.now(timezone.utc).strftime('%Y-%m-%d-%H-%M')
+        session_key = session_base if chunk_index == 0 else f"{session_base}-B{chunk_index + 1}"
+        max_summaries_per_bulletin = 25
+        if len(summary_ids) <= max_summaries_per_bulletin:
+            await self.db.execute(
+                'create_bulletin',
+                group_name=group_name,
+                session_key=session_key,
+                introduction=introduction or "",
+                summary_ids=summary_ids,
+                feed_slugs=feed_slugs,
+                title=final_title,
+            )
+            logger.info(
+                "Created bulletin record for '%s' session '%s' with %d summaries",
+                group_name,
+                session_key,
+                len(summary_ids),
+            )
+        else:
+            for i in range(0, len(summary_ids), max_summaries_per_bulletin):
+                chunk_ids = summary_ids[i:i + max_summaries_per_bulletin]
+                chunk_key = f"{session_key}-{i // max_summaries_per_bulletin + 1}"
+                chunk_summaries = [
+                    s for s in summaries
+                    if any(source_id in chunk_ids for source_id in self._summary_id_list(s))
+                ]
+                chunk_intro = ""
+                if enable_intro and config.AZURE_ENDPOINT and config.OPENAI_API_KEY and chunk_summaries:
+                    try:
+                        chunk_markdown = self._generate_markdown_bulletin(chunk_summaries)
+                        async with ClientSession() as session:
+                            chunk_intro = await self._generate_ai_introduction(chunk_markdown, session) or ""
+                    except Exception as e:
+                        logger.error(f"Error generating AI introduction for '{group_name}' chunk {chunk_key}: {e}")
+                chunk_title = None
+                if config.AZURE_ENDPOINT and config.OPENAI_API_KEY and chunk_summaries:
+                    try:
+                        async with ClientSession() as session:
+                            chunk_markdown = self._generate_markdown_bulletin(chunk_summaries)
+                            chunk_title = await self._generate_ai_title(chunk_markdown, session)
+                    except Exception as e:
+                        logger.debug(f"AI title generation failed for chunk {chunk_key}: {e}")
+                if not chunk_title:
+                    try:
+                        chunk_titles = [
+                            (s.get('item_title') or s.get('title', '')).strip()
+                            for s in chunk_summaries
+                            if (s.get('item_title') or s.get('title'))
+                        ]
+                        if chunk_titles:
+                            heuristic = ", ".join(chunk_titles[:5])[:120]
+                            chunk_title = f"{group_name.title()}: {heuristic}".rstrip(' ,')
+                    except Exception:
+                        pass
+                    if not chunk_title:
+                        try:
+                            chunk_title = self._generate_title_from_introduction(chunk_intro or "", group_name, chunk_key)
+                        except Exception:
+                            chunk_title = f"{group_name.title()} Bulletin #{chunk_key.split('-')[-1]}"
+                await self.db.execute(
+                    'create_bulletin',
+                    group_name=group_name,
+                    session_key=chunk_key,
+                    introduction=chunk_intro or "",
+                    summary_ids=chunk_ids,
+                    feed_slugs=feed_slugs,
+                    title=chunk_title,
+                )
+                logger.info(
+                    "Created bulletin record for '%s' session '%s' with %d summaries",
+                    group_name,
+                    chunk_key,
+                    len(chunk_ids),
+                )
+
+        return len(summaries)
+
     @trace_span(
         "publish_html_bulletin",
         tracer_name="publisher",
@@ -1282,287 +1816,51 @@ class RSSPublisher:
         """Publish an HTML bulletin for a summary group."""
         try:
             logger.info(f"Publishing HTML bulletin for group '{group_name}' with feeds: {feed_slugs}")
-            
-            # Get latest summaries for the feeds
-            summaries = await self.get_latest_summaries_for_feeds(feed_slugs, limit=100)
+            chunk_limit = max(1, config.BULLETIN_SUMMARY_LIMIT)
+            per_feed_limit = min(chunk_limit, self._compute_per_feed_limit(feed_slugs))
+            max_chunks = max(1, config.BULLETIN_MAX_CHUNKS)
+            total_processed = 0
+            chunk_index = 0
 
-            # Normalize date fields to datetime objects for template safety
-            if summaries:
-                for s in summaries:
-                    try:
-                        d = s.get('item_date')
-                        if d:
-                            # Already a datetime?
-                            if hasattr(d, 'strftime'):
-                                pass
-                            elif isinstance(d, (int, float)):
-                                s['item_date'] = datetime.fromtimestamp(int(d), tz=timezone.utc)
-                            elif isinstance(d, str):
-                                # Try common formats
-                                ds = d.strip()
-                                # Handle trailing Z
-                                if ds.endswith('Z'):
-                                    ds_try = ds[:-1]
-                                else:
-                                    ds_try = ds
-                                parsed = None
-                                for fmt in ('%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S'):
-                                    try:
-                                        parsed = datetime.strptime(ds_try, fmt).replace(tzinfo=timezone.utc)
-                                        break
-                                    except Exception:
-                                        continue
-                                if not parsed:
-                                    # Fallback: fromisoformat (Python 3.11+ handles offsets) inside try
-                                    try:
-                                        parsed = datetime.fromisoformat(ds_try)
-                                        if parsed.tzinfo is None:
-                                            parsed = parsed.replace(tzinfo=timezone.utc)
-                                    except Exception:
-                                        parsed = None
-                                if parsed:
-                                    s['item_date'] = parsed
-                                else:
-                                    # Drop invalid date to avoid template errors
-                                    s['item_date'] = None
-                    except Exception:
-                        # On any normalization error, null out date to keep rendering robust
-                        try:
-                            s['item_date'] = None
-                        except Exception:
-                            pass
-            
-            if not summaries:
-                logger.info(f"No unpublished summaries found for group '{group_name}'")
-                return True  # Not an error, just no content
-            
-            # Diagnostics: log distribution by topic and by feed
-            try:
-                by_topic = {}
-                by_feed = {}
-                for s in summaries:
-                    t = s.get('topic') or 'General'
-                    by_topic[t] = by_topic.get(t, 0) + 1
-                    f = s.get('feed_slug') or ''
-                    if f:
-                        by_feed[f] = by_feed.get(f, 0) + 1
-                topic_info = ", ".join([f"{k}:{v}" for k, v in sorted(by_topic.items())])
-                feed_info = ", ".join([f"{k}:{v}" for k, v in sorted(by_feed.items())])
-                logger.info(f"Bulletin '{group_name}' will include {len(summaries)} summaries across {len(by_topic)} topic(s): {topic_info}")
-                if by_feed:
-                    logger.debug(f"Bulletin '{group_name}' feed distribution: {feed_info}")
-                if len(by_topic) == 1 and len(summaries) <= 2:
-                    logger.warning(f"Bulletin '{group_name}' appears small (topics={len(by_topic)}, items={len(summaries)}). Check summarizer logs for content filtering or limited new items.")
-            except Exception:
-                pass
-            
-            # Generate AI introduction and title if configured
-            introduction: Optional[str] = None
-            ai_title: Optional[str] = None
-            if enable_intro and config.AZURE_ENDPOINT and config.OPENAI_API_KEY:
-                try:
-                    markdown_bulletin = self._generate_markdown_bulletin(summaries)
-                    async with ClientSession() as session:
-                        # Introduction
-                        introduction = await self._generate_ai_introduction(markdown_bulletin, session)
-                        if introduction:
-                            logger.info(f"Generated AI introduction for '{group_name}' ({len(introduction)} characters)")
-                        else:
-                            logger.warning(f"Failed to generate AI introduction for '{group_name}'")
-                        # Title
-                        ai_title = await self._generate_ai_title(markdown_bulletin, session)
-                        if ai_title:
-                            logger.info(f"Generated AI title for '{group_name}': '{ai_title[:120]}'")
-                        else:
-                            logger.warning(f"Primary AI title attempt empty for '{group_name}' with intro enabled; will perform alternative title attempt")
-                            # Alternative condensed attempt using top item titles
-                            try:
-                                condensed_titles = [ (s.get('item_title') or s.get('title','')).strip() for s in summaries if (s.get('item_title') or s.get('title')) ]
-                                condensed = "\n".join(condensed_titles[:8])
-                                if condensed:
-                                    alt_prompt = f"Generate a concise bulletin title summarizing these article titles:\n{condensed}"
-                                    async with ClientSession() as session_alt:
-                                        alt_messages = []
-                                        system_prompt = self.prompts.get('title_system') or self.prompts.get('system_title') or ''
-                                        if system_prompt:
-                                            alt_messages.append({"role": "system", "content": system_prompt})
-                                        alt_messages.append({"role": "user", "content": alt_prompt})
-                                        alt_title = await ai_chat_completion(alt_messages, purpose="title_alt", postprocess=lambda r: r.splitlines()[0].strip())
-                                        if alt_title:
-                                            ai_title = alt_title
-                                            logger.info(f"Alternative AI title for '{group_name}': '{ai_title[:120]}'")
-                                else:
-                                    logger.debug(f"No condensed titles available for alternative AI title attempt '{group_name}'")
-                            except Exception as e:
-                                logger.debug(f"Alternative AI title attempt failed for '{group_name}': {e}")
-                except Exception as e:
-                    logger.error(f"Error generating AI intro/title for '{group_name}': {e}")
-            else:
-                # Even if intro disabled, title may still be generated if Azure is configured
-                if config.AZURE_ENDPOINT and config.OPENAI_API_KEY:
-                    try:
-                        markdown_bulletin = self._generate_markdown_bulletin(summaries)
-                        async with ClientSession() as session:
-                            ai_title = await self._generate_ai_title(markdown_bulletin, session)
-                            if ai_title:
-                                logger.info(f"Generated AI title for '{group_name}': '{ai_title[:120]}'")
-                            else:
-                                logger.warning(f"Primary AI title attempt empty for '{group_name}' (intro disabled); performing alternative title attempt")
-                                try:
-                                    condensed_titles = [ (s.get('item_title') or s.get('title','')).strip() for s in summaries if (s.get('item_title') or s.get('title')) ]
-                                    condensed = "\n".join(condensed_titles[:8])
-                                    if condensed:
-                                        alt_prompt = f"Generate a concise bulletin title summarizing these article titles:\n{condensed}"
-                                        async with ClientSession() as session_alt:
-                                            alt_messages = []
-                                            system_prompt = self.prompts.get('title_system') or self.prompts.get('system_title') or ''
-                                            if system_prompt:
-                                                alt_messages.append({"role": "system", "content": system_prompt})
-                                            alt_messages.append({"role": "user", "content": alt_prompt})
-                                            alt_title = await ai_chat_completion(alt_messages, purpose="title_alt", postprocess=lambda r: r.splitlines()[0].strip())
-                                            if alt_title:
-                                                ai_title = alt_title
-                                                logger.info(f"Alternative AI title for '{group_name}': '{ai_title[:120]}'")
-                                    else:
-                                        logger.debug(f"No condensed titles available for alternative AI title attempt '{group_name}' (intro disabled)")
-                                except Exception as e:
-                                    logger.debug(f"Alternative AI title attempt failed for '{group_name}' (intro disabled): {e}")
-                    except Exception as e:
-                        logger.error(f"Error generating AI title for '{group_name}': {e}")
-            
-            # Generate HTML content
-            # Establish a unified final title BEFORE rendering HTML so RSS and HTML match.
-            # Reuse existing heuristic cascade (AI title -> concatenated item titles -> intro-derived fallback).
-            final_title = ai_title
-            if not final_title:
-                try:
-                    concat_titles = [ (s.get('item_title') or s.get('title','')).strip() for s in summaries if (s.get('item_title') or s.get('title')) ]
-                    if concat_titles:
-                        heuristic = ", ".join(concat_titles[:5])[:120]
-                        final_title = f"{group_name.title()}: {heuristic}".rstrip(' ,')
-                except Exception:
-                    pass
-                if not final_title:
-                    try:
-                        # Use a provisional session key based on current time for fallback title generation
-                        provisional_session_key = datetime.now(timezone.utc).strftime('%Y-%m-%d-%H-%M')
-                        final_title = self._generate_title_from_introduction(introduction or "", group_name, provisional_session_key)
-                    except Exception:
-                        final_title = f"{group_name.title()} Bulletin"
+            while chunk_index < max_chunks:
+                summaries = await self.get_latest_summaries_for_feeds(
+                    feed_slugs,
+                    limit=chunk_limit,
+                    per_feed_limit=per_feed_limit,
+                )
+                if not summaries:
+                    if chunk_index == 0:
+                        logger.info(f"No unpublished summaries found for group '{group_name}'")
+                    break
 
-            html_content = self._generate_html_content(group_name, feed_slugs, summaries, introduction, final_title)
-            
-            # Write to file atomically
-            output_file = self.html_bulletins_dir / f"{group_name}.html"
-            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', suffix='.html', 
-                                           dir=self.html_bulletins_dir, delete=False) as temp_file:
-                temp_file.write(html_content)
-                temp_file.flush()
-                os.fsync(temp_file.fileno())
-                temp_path = temp_file.name
-            
-            # Atomic move
-            shutil.move(temp_path, output_file)
-            
-            # Check if bulletins already exist for these summaries
-            summary_ids = [s['id'] for s in summaries]
-            
-            # Check if any of these summaries are already in bulletins
-            existing_bulletins = await self._check_existing_bulletins_for_summaries(group_name, summary_ids)
-            
-            if existing_bulletins:
-                logger.info(f"Summaries for group '{group_name}' already exist in {len(existing_bulletins)} bulletins - skipping creation")
-                return True
-            
-            # Mark summaries as published and get the actual published timestamp
-            published_count = await self.mark_summaries_as_published(summary_ids)
-            
-            # Create bulletin record in database for caching (only if not already existing)
-            if summary_ids and published_count > 0:
-                try:
-                    # Generate session key based on the actual publication timestamp (now that they're marked)
-                    # Use a consistent timestamp for all summaries in this batch
-                    current_time = datetime.now(timezone.utc)
-                    session_key = current_time.strftime('%Y-%m-%d-%H-%M')
-                    
-                    # If we have many summaries, create multiple bulletins
-                    max_summaries_per_bulletin = 25  # Increased to reduce unnecessary chunking
-                    if len(summary_ids) <= max_summaries_per_bulletin:
-                        # Generate AI title already attempted above (ai_title). Fallback to intro/session-derived title if missing.
-                        # final_title already determined pre-render; reuse it to ensure consistency.
-                        # (If heuristics differ due to time, prefer previously computed final_title.)
-                        await self.db.execute('create_bulletin',
-                                               group_name=group_name,
-                                               session_key=session_key,
-                                               introduction=introduction or "",  # Empty string if no introduction
-                                               summary_ids=summary_ids,
-                                               feed_slugs=feed_slugs,
-                                               title=final_title)
-                        logger.info(f"Created bulletin record for '{group_name}' session '{session_key}' with {len(summary_ids)} summaries (title='{final_title[:80] if final_title else ''}')")
-                    else:
-                        # Multiple bulletins - generate separate introductions for each chunk
-                        for i in range(0, len(summary_ids), max_summaries_per_bulletin):
-                            chunk_ids = summary_ids[i:i + max_summaries_per_bulletin]
-                            chunk_key = f"{session_key}-{i//max_summaries_per_bulletin + 1}"
-                            
-                            # Get the actual summaries for this chunk to generate a specific introduction
-                            chunk_summaries = [s for s in summaries if s['id'] in chunk_ids]
-                            
-                            # Generate a specific introduction for this chunk (only if enabled)
-                            chunk_intro = ""
-                            if enable_intro and config.AZURE_ENDPOINT and config.OPENAI_API_KEY and chunk_summaries:
-                                try:
-                                    chunk_markdown = self._generate_markdown_bulletin(chunk_summaries)
-                                    async with ClientSession() as session:
-                                        chunk_intro = await self._generate_ai_introduction(chunk_markdown, session)
-                                        if chunk_intro:
-                                            logger.info(f"Generated specific AI introduction for '{group_name}' chunk {chunk_key} ({len(chunk_intro)} characters)")
-                                        else:
-                                            logger.warning(f"Failed to generate AI introduction for '{group_name}' chunk {chunk_key}")
-                                except Exception as e:
-                                    logger.error(f"Error generating AI introduction for '{group_name}' chunk {chunk_key}: {e}")
-                            
-                            # Attempt AI title for this chunk; fallback if unavailable.
-                            chunk_title = None
-                            if config.AZURE_ENDPOINT and config.OPENAI_API_KEY and chunk_summaries:
-                                try:
-                                    async with ClientSession() as session:
-                                        chunk_markdown = self._generate_markdown_bulletin(chunk_summaries)
-                                        chunk_ai_title = await self._generate_ai_title(chunk_markdown, session)
-                                        if chunk_ai_title:
-                                            chunk_title = chunk_ai_title
-                                            logger.info(f"Generated AI title for '{group_name}' chunk {chunk_key}: '{chunk_ai_title[:120]}'")
-                                except Exception as e:
-                                    logger.debug(f"AI title generation failed for chunk {chunk_key}: {e}")
-                            if not chunk_title:
-                                # Heuristic concatenation before intro-based fallback
-                                try:
-                                    chunk_titles = [ (s.get('item_title') or s.get('title','')).strip() for s in chunk_summaries if (s.get('item_title') or s.get('title')) ]
-                                    if chunk_titles:
-                                        heuristic = ", ".join(chunk_titles[:5])[:120]
-                                        chunk_title = f"{group_name.title()}: {heuristic}".rstrip(' ,')
-                                except Exception:
-                                    pass
-                                if not chunk_title:
-                                    try:
-                                        chunk_title = self._generate_title_from_introduction(chunk_intro or "", group_name, chunk_key)
-                                    except Exception:
-                                        chunk_title = f"{group_name.title()} Bulletin #{chunk_key.split('-')[-1]}"
-                            await self.db.execute('create_bulletin',
-                                                   group_name=group_name,
-                                                   session_key=chunk_key,
-                                                   introduction=chunk_intro or "",
-                                                   summary_ids=chunk_ids,
-                                                   feed_slugs=feed_slugs,
-                                                   title=chunk_title)
-                            logger.info(f"Created bulletin record for '{group_name}' session '{chunk_key}' with {len(chunk_ids)} summaries (title='{chunk_title[:80] if chunk_title else ''}')")
-                
-                except Exception as e:
-                    logger.warning(f"Failed to create bulletin record for '{group_name}': {e}")
-            else:
-                logger.warning(f"No bulletin created for '{group_name}' - no summaries were marked as published")
-            
-            logger.info(f"Successfully published {len(summaries)} summaries to {output_file}")
+                processed = await self._process_bulletin_chunk(
+                    group_name=group_name,
+                    feed_slugs=feed_slugs,
+                    summaries=summaries,
+                    enable_intro=enable_intro,
+                    render_html=(chunk_index == 0),
+                    chunk_index=chunk_index,
+                )
+                total_processed += processed
+                chunk_index += 1
+
+                if processed == 0:
+                    logger.warning(
+                        "Stopping bulletin backlog loop for '%s' because chunk #%d produced no new publications",
+                        group_name,
+                        chunk_index,
+                    )
+                    break
+                if processed < chunk_limit:
+                    break
+
+            if total_processed > 0:
+                logger.info(
+                    "Published %d summaries for '%s' across %d chunk(s)",
+                    total_processed,
+                    group_name,
+                    chunk_index,
+                )
             return True
             
         except Exception as e:
@@ -1789,42 +2087,4 @@ class RSSPublisher:
 
         return html_count, rss_count, azure_results
 
-    async def _check_existing_bulletins_for_summaries(self, group_name: str, summary_ids: List[int]) -> List[str]:
-        """Check if any bulletins already exist for the given summary IDs.
-        
-        Args:
-            group_name: The summary group name
-            summary_ids: List of summary IDs to check
-            
-        Returns:
-            List of session keys for existing bulletins that contain these summaries
-        """
-        if not summary_ids:
-            return []
-            
-        try:
-            # Query the database to see if any of these summaries are already in bulletins
-            cursor = self.db.conn.cursor()
-            
-            # Create placeholders for the IN clause
-            placeholders = ','.join('?' for _ in summary_ids)
-            
-            query = f"""
-                SELECT DISTINCT b.session_key
-                FROM bulletins b
-                JOIN bulletin_summaries bs ON b.id = bs.bulletin_id
-                WHERE b.group_name = ? AND bs.summary_id IN ({placeholders})
-            """
-            
-            params = [group_name] + summary_ids
-            cursor.execute(query, params)
-            
-            results = cursor.fetchall()
-            session_keys = [row[0] for row in results]
-            
-            cursor.close()
-            return session_keys
-            
-        except Exception as e:
-            logger.warning(f"Error checking existing bulletins for group {group_name}: {e}")
-            return []
+    

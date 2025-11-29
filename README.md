@@ -29,6 +29,7 @@ It is also deployable as a Docker Swarm service using `kata`, a private helper t
 - Optional reader mode & GitHub README enrichment for richer summarization context
 - AI summarization with per‑group introductions (opt‑in) via Azure OpenAI
 - Topic/group bulletins rendered as responsive HTML + RSS 2.0 feeds
+- SimHash-powered dedupe merges near-duplicate summaries and surfaces every source link
 - Optional passthrough (raw) feeds with minimal processing
 - Smart time‑based scheduling (timezone aware) plus interval overrides
 - Azure Blob Storage upload with MD5 de‑dup (skip unchanged) & optional sync delete
@@ -58,7 +59,7 @@ Module | Responsibility
 `scheduler.py` | Time‑zone aware smart scheduling + status reporting.
 `models.py` | Async database queue (SQLite WAL) + safe operation batching.
 `config.py` | Centralized env/YAML/secrets loading + validation + normalization.
-`telemetry.py` | OpenTelemetry initialization & instrumentation (aiohttp, sqlite, logging spans).
+`telemetry.py` | OpenTelemetry initialization & instrumentation (`aiohttp`, sqlite, logging spans).
 `main.py` | Orchestrator & CLI entry point; composes pipeline steps.
 
 Processing flow (simplified):
@@ -85,7 +86,7 @@ Variable | Purpose | Notes
 ---------|---------|------
 AZURE_ENDPOINT | Azure OpenAI endpoint host (no scheme) | Auto-normalized (strip https://)
 OPENAI_API_KEY | Azure OpenAI API key | Required for summaries
-DEPLOYMENT_NAME | Model deployment (e.g. gpt-4o-mini) | Default: gpt-4o-mini
+DEPLOYMENT_NAME | Model deployment (e.g. `gpt-4o-mini`) | Default: `gpt-4o-mini`
 RSS_BASE_URL | Public base URL for generated links | Affects GUID/self links
 DATABASE_PATH | SQLite path | Default: feeds.db
 PUBLIC_DIR | Output directory root | Default: ./public
@@ -94,6 +95,12 @@ AZURE_STORAGE_KEY | Blob storage key | Optional
 AZURE_UPLOAD_SYNC_DELETE | Delete remote orphans | Default: false (danger when true)
 FETCH_INTERVAL_MINUTES | Base interval fallback | Default: 30
 SCHEDULER_TIMEZONE | Override schedule TZ if not in feeds.yaml | Default: UTC
+MAX_ITEMS_PER_FEED | Per-feed physical retention cap | Default: 400
+SUMMARY_WINDOW_ITEMS | Unsummarized items per feed per summarizer pass | Default: 50
+BULLETIN_SUMMARY_LIMIT | Summaries per HTML bulletin chunk | Default: 100
+BULLETIN_PER_FEED_LIMIT | Max summaries a single feed can contribute to one chunk | Default: 40 (auto-reduced if many feeds)
+BULLETIN_MAX_CHUNKS | Backlog chunks processed per run | Default: 5
+`SIMHASH_HAMMING_THRESHOLD` | Max Hamming distance (0-64) for merging summaries | Default: 4 (set 0 to disable)
 LOG_LEVEL | DEBUG / INFO / WARNING / ERROR | Default: INFO
 DISABLE_TELEMETRY | Set true to disable all tracing/log export | Default: false
 
@@ -203,6 +210,7 @@ Operational guidance:
 - If some feeds are extremely high volume, lower `MAX_ITEMS_PER_FEED` (e.g. 200) for faster turnover.
 - To accelerate clearing a backlog, temporarily raise `SUMMARY_WINDOW_ITEMS` (e.g. to 80) then revert to keep prompts small.
 - For historical bulk summarization, raise `time_window_hours` first; count cap ensures DB won't explode.
+- High-fanout bulletin groups can now drain backlog fairly: adjust `BULLETIN_SUMMARY_LIMIT` (per chunk), `BULLETIN_PER_FEED_LIMIT` (per feed) and `BULLETIN_MAX_CHUNKS` (safety cap) so quieter feeds still get airtime even when paired with firehoses.
 
 Edge cases:
 
@@ -213,7 +221,7 @@ Adjust these values and restart to apply. The fetcher handles pruning; the summa
 
 ## 9. Roadmap Snapshot
 
-- Expand pytest coverage (fetcher scheduling, scheduler, Azure upload paths)
+- Expand test coverage (`pytest`: fetcher scheduling, scheduler, Azure upload paths)
 - Harden HTML sanitization (allowlist schemes/attributes)
 - Optional container image & `pyproject.toml` packaging
 
@@ -225,4 +233,4 @@ See `LICENSE` (MIT) for licensing details. Contribution guidelines and a code of
 
 ## Attribution
 
-Some components and refactorings were assisted by AI tooling; all code is reviewed for clarity and maintainability.
+Some components and refactoring work were assisted by AI tooling; all code is reviewed for clarity and maintainability.

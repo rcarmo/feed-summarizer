@@ -37,3 +37,5 @@ async def test_group_by_topic_and_generate_markdown(sample_entries):
     assert 'Ethical considerations in AI.' in markdown
     assert '# Tech' in markdown
     assert 'Advances in quantum computing.' in markdown
+    assert all(len(entry) == 3 for entry in summaries_dict.values())
+    assert any(entry[2] for entry in summaries_dict.values())

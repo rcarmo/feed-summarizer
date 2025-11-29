@@ -12,12 +12,13 @@ import json
 from sqlite3 import connect, Row, Error
 from asyncio import Queue, create_task, wait_for, TimeoutError, CancelledError, Event, Lock
 from uuid import uuid4
-from typing import Dict, List, Optional, Set, Any, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 import yaml
 
 # Import config for unified logging
 from config import config, get_logger
 from telemetry import get_tracer, trace_span
+from utils import encode_int64, decode_int64
 
 # Module-specific logger
 logger = get_logger("models")
@@ -67,6 +68,16 @@ def _run_migrations(conn) -> None:
             cursor.execute("ALTER TABLE summaries ADD COLUMN published_date INTEGER")
             conn.commit()
             logger.info("Migration completed: added published_date column")
+        if 'simhash' not in columns:
+            logger.info("Adding simhash column to summaries table")
+            cursor.execute("ALTER TABLE summaries ADD COLUMN simhash INTEGER")
+            conn.commit()
+            logger.info("Migration completed: added simhash column")
+        try:
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_summaries_simhash ON summaries(simhash)")
+            conn.commit()
+        except Exception as e:
+            logger.warning(f"Could not create idx_summaries_simhash (may already exist): {e}")
         
         # Migration 2: Add bulletins and bulletin_summaries tables if they don't exist
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='bulletins'")
@@ -577,34 +588,35 @@ class DatabaseQueue:
             logger.error(f"Error marking summaries as published {summary_ids}: {e}")
             return 0
 
-    def query_summaries_for_feeds(self, feed_slugs: List[str], limit: int = 50) -> List[Dict[str, Any]]:
-        """Query summaries for specific feeds for HTML publishing.
-        
+    def query_summaries_for_feeds(self, feed_slugs: List[str], limit: int = 50, per_feed_limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Query unpublished summaries for specific feeds (fair per-feed sampling).
+
         Args:
             feed_slugs: List of feed slugs to query
-            limit: Maximum number of summaries to return
-            
+            limit: Maximum number of summaries to return overall
+            per_feed_limit: Cap per feed before merging (defaults to limit)
+
         Returns:
-            List of dictionaries with summary details
+            List of dictionaries with summary details ordered by original item date
         """
-        if not feed_slugs:
+        if not feed_slugs or limit <= 0:
             return []
-            
+
         cursor = None
         try:
             with self.conn:
                 cursor = self.conn.cursor()
                 cursor.row_factory = Row
-                
-                # Create placeholders for the IN clause
-                placeholders = ','.join(['?' for _ in feed_slugs])
-                
-                # Query for unpublished summaries from specified feeds, ordered by original item date
-                query = f"""
+                per_feed = per_feed_limit or limit
+                aggregated: List[Dict[str, Any]] = []
+                seen_ids: Set[int] = set()
+
+                base_query = """
                     SELECT 
                         s.id,
                         s.summary_text,
                         s.topic,
+                        s.simhash,
                         s.generated_date,
                         s.published_date,
                         i.title as item_title,
@@ -615,44 +627,85 @@ class DatabaseQueue:
                     FROM summaries s
                     JOIN items i ON s.id = i.id
                     JOIN feeds f ON i.feed_id = f.id
-                    WHERE f.slug IN ({placeholders}) 
+                    WHERE f.slug = ?
                     AND s.summary_text IS NOT NULL
                     AND s.summary_text != ''
                     AND s.published_date IS NULL
                     ORDER BY i.date DESC
                     LIMIT ?
                 """
-                
-                cursor.execute(query, feed_slugs + [limit])
-                rows = cursor.fetchall()
-                
-                # Convert to list of dictionaries
-                summaries = []
-                for row in rows:
-                    summaries.append({
-                        'id': row['id'],
-                        'summary_text': row['summary_text'],
-                        'topic': row['topic'],
-                        'generated_date': row['generated_date'],
-                        'published_date': row['published_date'],
-                        'item_title': row['item_title'],
-                        'item_url': row['item_url'],
-                        'item_date': row['item_date'],
-                        'feed_title': row['feed_title'],
-                        'feed_slug': row['feed_slug']
-                    })
-                
-                logger.debug(f"Found {len(summaries)} summaries for feeds: {feed_slugs}")
+
+                for slug in feed_slugs:
+                    cursor.execute(base_query, (slug, per_feed))
+                    rows = cursor.fetchall()
+                    for row in rows:
+                        summary_id = row['id']
+                        if summary_id in seen_ids:
+                            continue
+                        seen_ids.add(summary_id)
+                        aggregated.append({
+                            'id': row['id'],
+                            'summary_text': row['summary_text'],
+                            'topic': row['topic'],
+                                'simhash': decode_int64(row['simhash']),
+                            'generated_date': row['generated_date'],
+                            'published_date': row['published_date'],
+                            'item_title': row['item_title'],
+                            'item_url': row['item_url'],
+                            'item_date': row['item_date'],
+                            'feed_title': row['feed_title'],
+                            'feed_slug': row['feed_slug']
+                        })
+
+                # Sort merged results (newest items first) and truncate to the requested limit
+                aggregated.sort(key=lambda row: row['item_date'] or 0, reverse=True)
+                summaries = aggregated[:limit]
+                logger.debug(
+                    "Found %d summaries across %d feeds (per_feed_limit=%d)",
+                    len(summaries),
+                    len(feed_slugs),
+                    per_feed,
+                )
                 return summaries
-                
+
         except Error as e:
             logger.error(f"Error querying summaries for feeds {feed_slugs}: {e}")
-            return []
+            raise
         finally:
             if cursor:
                 try:
                     cursor.close()
-                except:
+                except Exception:
+                    pass
+
+    def find_bulletin_sessions_for_summaries(self, group_name: str, summary_ids: List[int]) -> List[str]:
+        """Return session keys for bulletins that already reference the provided summaries."""
+        if not summary_ids:
+            return []
+
+        cursor = None
+        try:
+            cursor = self.conn.cursor()
+            placeholders = ','.join('?' for _ in summary_ids)
+            query = f"""
+                SELECT DISTINCT b.session_key
+                FROM bulletins b
+                JOIN bulletin_summaries bs ON b.id = bs.bulletin_id
+                WHERE b.group_name = ?
+                AND bs.summary_id IN ({placeholders})
+            """
+            params = [group_name] + summary_ids
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+            return [row[0] for row in rows]
+        except Error as e:
+            logger.error(f"Error finding bulletin sessions for {group_name}: {e}")
+            raise
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except Exception:
                     pass
 
     def query_unpublished_summaries_for_feeds(self, feed_slugs: List[str], limit: int = 50) -> List[Dict[str, Any]]:
@@ -683,6 +736,7 @@ class DatabaseQueue:
                         s.id,
                         s.summary_text,
                         s.topic,
+                        s.simhash,
                         s.generated_date,
                         s.published_date,
                         i.title as item_title,
@@ -711,6 +765,7 @@ class DatabaseQueue:
                         'id': row['id'],
                         'summary_text': row['summary_text'],
                         'topic': row['topic'],
+                        'simhash': decode_int64(row['simhash']),
                         'generated_date': row['generated_date'],
                         'published_date': row['published_date'],
                         'item_title': row['item_title'],
@@ -761,6 +816,7 @@ class DatabaseQueue:
                         s.id,
                         s.summary_text,
                         s.topic,
+                        s.simhash,
                         s.generated_date,
                         s.published_date,
                         i.title as item_title,
@@ -789,6 +845,7 @@ class DatabaseQueue:
                         'id': row['id'],
                         'summary_text': row['summary_text'],
                         'topic': row['topic'],
+                        'simhash': decode_int64(row['simhash']),
                         'generated_date': row['generated_date'],
                         'published_date': row['published_date'],
                         'item_title': row['item_title'],
@@ -999,7 +1056,7 @@ class DatabaseQueue:
             
             logger.debug("Found %d unsummarized items for feeds: %s", len(items), slugs)
             if len(items) > 0:
-                logger.info("Processing %d unsummarized items from feeds: %s", len(items), slugs)
+                logger.info("Processing %d unsummarized items from feeds: %s", len(items), ",".join(slugs))
             return items
             
         except Error as e:
@@ -1012,13 +1069,13 @@ class DatabaseQueue:
                 except:
                     pass
 
-    def verify_and_mark_as_summarized(self, ids: List[int], summaries: Dict[int, Tuple[str, str]]) -> int:
+    def verify_and_mark_as_summarized(self, ids: List[int], summaries: Dict[int, Tuple[str, str, Optional[int]]]) -> int:
         """
         Verify that the given item IDs exist and mark them as summarized with their summaries.
         
         Args:
             ids: List of item IDs to verify and mark as summarized
-            summaries: Dictionary mapping item IDs to (summary_text, topic) tuples
+            summaries: Dictionary mapping item IDs to (summary_text, topic, simhash) tuples
             
         Returns:
             Number of items successfully marked as summarized
@@ -1046,12 +1103,17 @@ class DatabaseQueue:
             for item_id in existing_ids:
                 summary_info = summaries.get(item_id)
                 if summary_info:
-                    summary_text, topic = summary_info
+                    if len(summary_info) == 3:
+                        summary_text, topic, simhash = summary_info
+                    else:
+                        summary_text, topic = summary_info  # type: ignore[misc]
+                        simhash = None
+                    simhash = encode_int64(simhash)
                     try:
                         cursor.execute("""
-                            INSERT OR REPLACE INTO summaries (id, summary_text, topic, generated_date)
-                            VALUES (?, ?, ?, ?)
-                        """, (item_id, summary_text, topic, int(time())))
+                            INSERT OR REPLACE INTO summaries (id, summary_text, topic, generated_date, simhash)
+                            VALUES (?, ?, ?, ?, ?)
+                        """, (item_id, summary_text, topic, int(time()), simhash))
                         insert_count += 1
                     except Error as e:
                         logger.error(f"Error inserting summary for item {item_id}: {e}")
@@ -1284,6 +1346,7 @@ class DatabaseQueue:
             cursor.execute("""
                 SELECT 
                     s.id, s.summary_text, s.topic, s.generated_date, s.published_date,
+                    s.simhash,
                     i.title as item_title, i.url as item_url, i.date as item_date,
                     f.title as feed_title, f.slug as feed_slug
                 FROM bulletin_summaries bs
@@ -1303,6 +1366,7 @@ class DatabaseQueue:
                     'id': row['id'],
                     'summary_text': row['summary_text'],
                     'topic': row['topic'],
+                    'simhash': decode_int64(row['simhash']),
                     'generated_date': row['generated_date'],
                     'published_date': row['published_date'],
                     'item_title': row['item_title'],
