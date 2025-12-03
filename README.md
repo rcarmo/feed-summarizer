@@ -12,18 +12,30 @@ It is also deployable as a Docker Swarm service using `kata`, a private helper t
 
 ## Contents
 
-1. Features
-2. Quickstart (5 commands)
+1. Quickstart (5 commands)
+2. Features
 3. Architecture (high‑level)
 4. Configuration & Environment
 5. Running (one‑shot vs scheduled vs step modes)
 6. Publishing Outputs (HTML / RSS / passthrough / Azure)
-7. Telemetry (opt‑out / service naming)
-8. Troubleshooting
-9. Roadmap Snapshot
-10. Age Window & Retention
+7. Age Window & Retention
+8. Telemetry (opt‑out / service naming)
+9. Troubleshooting
+10. Roadmap Snapshot
 
-## 1. Features
+## 1. Quickstart (5 commands)
+
+```bash
+python -m venv .venv              # 1. Create virtualenv
+source .venv/bin/activate         # 2. Activate it
+pip install -r requirements.txt   # 3. Install dependencies
+cp feeds.yaml.example feeds.yaml  # 4. Seed a starter config (edit it)
+python main.py run                # 5. One full pipeline run (fetch→summarize→publish→upload*)
+```
+
+(*) Azure upload happens only if storage env vars are set; otherwise it is skipped automatically.
+
+## 2. Features
 
 - Concurrent conditional feed fetching (ETag / Last-Modified; respectful backoff & error tracking)
 - Optional reader mode & GitHub README enrichment for richer summarization context
@@ -36,18 +48,6 @@ It is also deployable as a Docker Swarm service using `kata`, a private helper t
 - Graceful shutdown with executor timeouts and robust logging
 - Config hot‑reload for feeds; caching of YAML & prompt data
 - Observability hooks via OpenTelemetry (HTTP, DB, custom spans)
-
-## 2. Quickstart (5 commands)
-
-```bash
-python -m venv .venv              # 1. Create virtualenv
-source .venv/bin/activate         # 2. Activate it
-pip install -r requirements.txt   # 3. Install dependencies
-cp feeds.yaml.example feeds.yaml  # 4. Seed a starter config (edit it)
-python main.py run                # 5. One full pipeline run (fetch→summarize→publish→upload*)
-```
-
-(*) Azure upload happens only if storage env vars are set; otherwise it is skipped automatically.
 
 ## 3. Architecture (High‑Level)
 
@@ -157,30 +157,7 @@ Azure Upload:
 - Set `AZURE_UPLOAD_SYNC_DELETE=true` to purge remote files not present locally.
 - Upload step computes MD5 to skip unchanged blobs.
 
-## 7. Telemetry
-
-Feature | How
---------|-----
-Disable all telemetry | `DISABLE_TELEMETRY=true`
-Service name override | `OTEL_SERVICE_NAME=feed-summarizer-prod`
-Environment tag | `OTEL_ENVIRONMENT=production`
-Azure exporter | Provide `APPLICATIONINSIGHTS_CONNECTION_STRING` (or legacy instrumentation key)
-
-If no connection string, spans stay in-process (no console spam). Logs can also be exported when Azure exporter is available.
-
-## 8. Troubleshooting
-
-Symptom | Cause | Fix
---------|-------|----
-Empty summaries | Missing / bad Azure config | Check endpoint host (no scheme), key, deployment
-Few bulletin items | Items filtered / no new content | Verify fetcher logs & summary successes
-Broken feed links | Wrong `RSS_BASE_URL` | Set correct public domain before publishing
-Slow summarization | Rate limit / large content | Adjust `SUMMARIZER_REQUESTS_PER_MINUTE` / enable reader mode selectively
-Missing Azure upload | Vars unset | Provide storage account + key or run without upload
-Telemetry missing | Disabled or no exporter | Remove `DISABLE_TELEMETRY` / set connection string
-Empty summaries with token usage | New structured response format returned parts list | Upgrade includes parser: ensure you pulled latest `ai_client.py`
-
-## 10. Age Window & Retention (Refactored)
+## 7. Age Window & Retention
 
 Three complementary controls govern how long items stick around and which are summarized:
 
@@ -219,7 +196,30 @@ Edge cases:
 
 Adjust these values and restart to apply. The fetcher handles pruning; the summarizer reads window sizes dynamically each pass.
 
-## 9. Roadmap Snapshot
+## 8. Telemetry
+
+Feature | How
+--------|-----
+Disable all telemetry | `DISABLE_TELEMETRY=true`
+Service name override | `OTEL_SERVICE_NAME=feed-summarizer-prod`
+Environment tag | `OTEL_ENVIRONMENT=production`
+Azure exporter | Provide `APPLICATIONINSIGHTS_CONNECTION_STRING` (or legacy instrumentation key)
+
+If no connection string, spans stay in-process (no console spam). Logs can also be exported when Azure exporter is available.
+
+## 9. Troubleshooting
+
+Symptom | Cause | Fix
+--------|-------|----
+Empty summaries | Missing / bad Azure config | Check endpoint host (no scheme), key, deployment
+Few bulletin items | Items filtered / no new content | Verify fetcher logs & summary successes
+Broken feed links | Wrong `RSS_BASE_URL` | Set correct public domain before publishing
+Slow summarization | Rate limit / large content | Adjust `SUMMARIZER_REQUESTS_PER_MINUTE` / enable reader mode selectively
+Missing Azure upload | Vars unset | Provide storage account + key or run without upload
+Telemetry missing | Disabled or no exporter | Remove `DISABLE_TELEMETRY` / set connection string
+Empty summaries with token usage | New structured response format returned parts list | Upgrade includes parser: ensure you pulled latest `ai_client.py`
+
+## 10. Roadmap Snapshot
 
 - Expand test coverage (`pytest`: fetcher scheduling, scheduler, Azure upload paths)
 - Harden HTML sanitization (allowlist schemes/attributes)
